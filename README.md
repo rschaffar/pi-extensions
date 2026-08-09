@@ -123,6 +123,41 @@ commands, settings persistence, confirmations, and specialized UI.
 ## 🔧 Advanced installation
 
 <details>
+<summary>Use the Nix flake outputs</summary>
+
+Add this repository as a flake input:
+
+```nix
+inputs.pi-extensions.url = "github:narumiruna/pi-extensions";
+```
+
+Every active extension is available by its unscoped directory name on `x86_64-linux` and `aarch64-linux`:
+
+```nix
+let
+  piExtensions = inputs.pi-extensions.packages.${pkgs.stdenv.hostPlatform.system};
+  piSettings = pkgs.writeText "pi-settings.json" (
+    builtins.toJSON {
+      packages = [
+        "${piExtensions.pi-accounts}"
+        "${piExtensions.pi-statusline}"
+      ];
+    }
+  );
+in
+# Install or copy piSettings as ~/.pi/agent/settings.json.
+piSettings
+```
+
+`packages.<system>.default` and `packages.<system>.stable-bundle` contain every stable extension.
+`overlays.default` exposes individual extensions as `pkgs.pi-accounts`, `pkgs.pi-statusline`, and similar names, plus the stable bundle as `pkgs.pi-extensions-stable`.
+`lib.extensionNames` and `lib.stableExtensionNames` expose evaluated metadata for consumers that generate configuration.
+
+Use `path:/absolute/path/to/pi-extensions` instead of the GitHub URL for a local checkout.
+
+</details>
+
+<details>
 <summary>Install this repository directly from GitHub</summary>
 
 Install the repository as one Pi package:
