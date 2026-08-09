@@ -1,4 +1,4 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { sanitizeTerminalText } from "@narumitw/pi-tui-kit/terminal-text";
 import {
 	type AccountStore,
@@ -56,6 +56,48 @@ type ProviderMenuState = {
 	selectionInvalid: boolean;
 	accounts: Record<string, StoredOAuthCredential>;
 };
+
+export async function showCurrentProviderAccountSelector(
+	ctx: ExtensionContext,
+	store: AccountStore,
+	adapters: Map<AccountProviderId, AccountProviderAdapter>,
+	session: AccountMenuSession,
+	switchAccount: AccountMenuHandlers["switch"],
+	owner: AccountMenuOwner,
+): Promise<void> {
+	if (!ctx.hasUI) {
+		ctx.ui.notify("Account switching requires interactive UI.", "error");
+		return;
+	}
+	const providerId = toProviderId(ctx.model?.provider);
+	if (!providerId || !adapters.has(providerId)) {
+		ctx.ui.notify("The current model provider has no managed OAuth accounts.", "warning");
+		return;
+	}
+	const states = await readProviderMenuStates(store, adapters, session);
+	if (!owner.isCurrent()) return;
+	const state = states.get(providerId);
+	if (!state) return;
+	const options = switchAccountOptions(
+		state.active,
+		Object.keys(state.accounts),
+		state.selectionInvalid,
+	);
+	if (options.length <= 1 && !state.selectionInvalid) {
+		ctx.ui.notify(
+			`No other ${state.adapter.displayName} accounts are available. Use /accounts to log in.`,
+			"info",
+		);
+		return;
+	}
+	const selected = await ctx.ui.select(`Switch ${state.adapter.displayName} account`, options, {
+		signal: owner.signal,
+	});
+	if (selected === undefined || !owner.isCurrent()) return;
+	const accountName = stripActiveMarker(selected);
+	if (!state.selectionInvalid && accountName === (state.active ?? "default")) return;
+	await switchAccount(state.adapter, accountName, owner.signal, owner.isCurrent);
+}
 
 export async function showAccountsMenu(
 	ctx: ExtensionCommandContext,

@@ -2,6 +2,9 @@
 // fixtures and cross-covers menus, OAuth, replacement, switching, persistence, and lifecycle safety.
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { InMemoryCredentialStore, type ModelAuth } from "@earendil-works/pi-ai";
 import {
 	type CustomEntry,
@@ -17,6 +20,7 @@ import {
 	createMockPi,
 } from "../../../test/support.js";
 import accountsExtension, {
+	ACCOUNT_SWITCH_SHORTCUT,
 	ACCOUNTS_STATUS_KEY,
 	AccountStore,
 	FAIL_CLOSED_API_KEY,
@@ -508,7 +512,7 @@ async function waitForTest(predicate: () => boolean): Promise<void> {
 	throw new Error("Timed out waiting for test state");
 }
 
-test("accounts registers only the interactive /accounts command and lifecycle hooks", () => {
+test("accounts registers its command, portable shortcut, and lifecycle hooks", () => {
 	const mock = createMockPi();
 	accountsExtension(mock.pi, {
 		store: new AccountStore(new InMemoryAccountStorageBackend()),
@@ -520,6 +524,8 @@ test("accounts registers only the interactive /accounts command and lifecycle ho
 	});
 
 	assert.deepEqual([...mock.commands.keys()].sort(), ["accounts"]);
+	assert.deepEqual([...mock.shortcuts.keys()], [ACCOUNT_SWITCH_SHORTCUT]);
+	assert.equal(ACCOUNT_SWITCH_SHORTCUT, "ctrl+alt+a");
 	assert.deepEqual([...mock.events.keys()].sort(), [
 		"before_agent_start",
 		"model_select",
@@ -553,6 +559,34 @@ test("accounts command ignores arguments but requires interactive UI", async () 
 	assert.equal(notifications.at(-1)?.level, "error");
 });
 
+test("accounts command and shortcut reject changes during an active run", async () => {
+	const mock = createMockPi();
+	accountsExtension(mock.pi, {
+		store: new AccountStore(new InMemoryAccountStorageBackend()),
+		providers: [
+			fakeProvider("openai-codex"),
+			fakeProvider("anthropic"),
+			fakeProvider("github-copilot"),
+		],
+	});
+	const { ctx, notifications, selectCalls } = createInteractiveAccountContext({
+		isIdle: () => false,
+		model: { provider: "anthropic", id: "claude" },
+	});
+
+	await mock.commands.get("accounts")?.handler("", ctx);
+	await mock.shortcuts.get(ACCOUNT_SWITCH_SHORTCUT)?.handler(ctx);
+
+	assert.equal(selectCalls.length, 0);
+	assert.equal(notifications.length, 2);
+	assert.equal(
+		notifications.every(
+			(entry) => entry.level === "warning" && /active agent run/.test(entry.message),
+		),
+		true,
+	);
+});
+
 test("accounts empty state offers only login and ignores command arguments", async () => {
 	const store = new AccountStore(new InMemoryAccountStorageBackend());
 	const mock = createMockPi();
@@ -574,6 +608,46 @@ test("accounts empty state offers only login and ignores command arguments", asy
 
 	assert.match(selectCalls[0]?.title ?? "", /No saved accounts yet/);
 	assert.deepEqual(selectCalls[0]?.options, ["Login new account"]);
+});
+
+test("portable account shortcut switches the current provider session selection", async () => {
+	const store = new AccountStore(new InMemoryAccountStorageBackend());
+	await store.write({
+		version: 1,
+		providers: {
+			anthropic: {
+				active: "personal",
+				accounts: { personal: credential("personal"), work: credential("work") },
+			},
+		},
+	});
+	const mock = createMockPi();
+	accountsExtension(mock.pi, {
+		store,
+		providers: [
+			fakeProvider("openai-codex"),
+			fakeProvider("anthropic"),
+			fakeProvider("github-copilot"),
+		],
+	});
+	const { registry, keys } = runtimeHarness(mock);
+	const sessionManager = createTestSessionManager();
+	const { ctx, selectCalls } = createInteractiveAccountContext(
+		{
+			model: { provider: "anthropic", id: "claude" },
+			modelRegistry: registry,
+			sessionManager,
+		},
+		{ selections: ["work"] },
+	);
+	await mock.events.get("session_start")?.[0]?.({}, ctx);
+
+	await mock.shortcuts.get(ACCOUNT_SWITCH_SHORTCUT)?.handler(ctx);
+
+	assert.equal(selectCalls[0]?.title, "Switch Anthropic account");
+	assert.deepEqual(selectCalls[0]?.options, ["✓ personal", "work", "default"]);
+	assert.equal(latestSessionSelections(sessionManager).anthropic, "work");
+	assert.equal(keys.get("anthropic"), "access-work");
 });
 
 test("accounts menu summarizes all supported providers and prioritizes current provider switch", async () => {
@@ -799,6 +873,94 @@ test("provider accounts activate independently and default clears only one provi
 	assert.equal(keys.has("anthropic"), false);
 	assert.equal(keys.get("openai-codex"), "access-codex");
 	assert.match(notifications.at(-1)?.message ?? "", /default Pi Anthropic login/);
+});
+
+test("new sessions inherit the newest usable selection from the same project", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-accounts-recent-session-"));
+	const project = join(root, "project");
+	const sessionDir = join(root, "sessions");
+	let mock: ReturnType<typeof createMockPi> | undefined;
+	let ctx: ReturnType<typeof createMockContext>["ctx"] | undefined;
+	try {
+		const sourceId = randomUUID();
+		const source = SessionManager.create(project, sessionDir, { id: sourceId });
+		source.appendCustomEntry(ACCOUNT_SELECTION_ENTRY_TYPE, {
+			version: 1,
+			sessionId: sourceId,
+			providers: {
+				anthropic: "work",
+				"github-copilot": null,
+				"openai-codex": null,
+			},
+		});
+		source.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "ready" }],
+			api: "openai-responses",
+			provider: "openai-codex",
+			model: "codex",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+
+		const store = new AccountStore(new InMemoryAccountStorageBackend());
+		await store.write({
+			version: 1,
+			providers: {
+				anthropic: {
+					active: "compatibility-default",
+					accounts: {
+						"compatibility-default": credential("compatibility"),
+						work: credential("work"),
+					},
+				},
+			},
+		});
+		mock = createMockPi();
+		accountsExtension(mock.pi, {
+			store,
+			providers: [
+				fakeProvider("openai-codex"),
+				fakeProvider("anthropic"),
+				fakeProvider("github-copilot"),
+			],
+		});
+		const { registry, keys } = runtimeHarness(mock);
+		const current = SessionManager.create(project, sessionDir, { id: randomUUID() });
+		const readStore = store.readAsync.bind(store);
+		let snapshotExistedBeforeFirstStoreRead: boolean | undefined;
+		store.readAsync = async () => {
+			snapshotExistedBeforeFirstStoreRead ??= Object.hasOwn(
+				latestSessionSelections(current),
+				"anthropic",
+			);
+			return readStore();
+		};
+		ctx = createMockContext({
+			cwd: project,
+			model: { provider: "anthropic", id: "claude" },
+			modelRegistry: registry,
+			sessionManager: current,
+		}).ctx;
+
+		await mock.events.get("session_start")?.[0]?.({ reason: "new" }, ctx);
+
+		assert.equal(snapshotExistedBeforeFirstStoreRead, true);
+		assert.equal(latestSessionSelections(current).anthropic, "work");
+		assert.equal(latestSessionSelections(current)["openai-codex"], null);
+		assert.equal(keys.get("anthropic"), "access-work");
+	} finally {
+		if (mock && ctx) await mock.events.get("session_shutdown")?.[0]?.({}, ctx);
+		await rm(root, { force: true, recursive: true });
+	}
 });
 
 test("concurrent sessions keep independent provider account selections", async () => {

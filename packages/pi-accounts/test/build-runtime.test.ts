@@ -197,6 +197,7 @@ test("generated runtime is loadable by Pi's Jiti resource loader", async () => {
 		const sessionId = "generated-session";
 		const ctx = {
 			hasUI: false,
+			isIdle: () => true,
 			model: undefined,
 			modelRegistry: {},
 			sessionManager: {

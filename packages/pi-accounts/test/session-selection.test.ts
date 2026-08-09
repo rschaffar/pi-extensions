@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -9,8 +9,10 @@ import {
 	ACCOUNT_SELECTION_ENTRY_TYPE,
 	cloneAccountSelections,
 	createAccountSelectionEntryData,
+	loadNewestProjectAccountSelections,
 	restoreAccountSelections,
 	setAccountSelection,
+	shouldLoadRecentAccountSelections,
 } from "../src/session-selection.js";
 
 function customEntry(data: unknown, id = randomUUID().slice(0, 8)): SessionEntry {
@@ -22,6 +24,26 @@ function customEntry(data: unknown, id = randomUUID().slice(0, 8)): SessionEntry
 		customType: ACCOUNT_SELECTION_ENTRY_TYPE,
 		data,
 	};
+}
+
+function persistSession(manager: SessionManager): void {
+	manager.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "ready" }],
+		api: "openai-responses",
+		provider: "openai-codex",
+		model: "codex",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
 }
 
 test("session account selections restore the latest matching session snapshot", () => {
@@ -105,6 +127,118 @@ test("session account selections ignore copied snapshots owned by another sessio
 	);
 
 	assert.deepEqual(restoreAccountSelections([copied], "child-session"), { status: "missing" });
+});
+
+test("recent account selection loading is limited to the newest usable project session", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-accounts-recent-selection-"));
+	const project = join(root, "project");
+	const otherProject = join(root, "other-project");
+	const sessionDir = join(root, "sessions");
+	try {
+		const sourceId = randomUUID();
+		const source = SessionManager.create(project, sessionDir, { id: sourceId });
+		source.appendCustomEntry(
+			ACCOUNT_SELECTION_ENTRY_TYPE,
+			createAccountSelectionEntryData(sourceId, {
+				anthropic: "work",
+				"future.provider": null,
+			}),
+		);
+		persistSession(source);
+		const sourceFile = source.getSessionFile();
+		assert.ok(sourceFile);
+
+		const invalidId = randomUUID();
+		const invalid = SessionManager.create(project, sessionDir, { id: invalidId });
+		invalid.appendCustomEntry(ACCOUNT_SELECTION_ENTRY_TYPE, {
+			version: 2,
+			sessionId: invalidId,
+			providers: { anthropic: "invalid" },
+		});
+		persistSession(invalid);
+		const invalidFile = invalid.getSessionFile();
+		assert.ok(invalidFile);
+
+		const unrelatedId = randomUUID();
+		const unrelated = SessionManager.create(otherProject, sessionDir, { id: unrelatedId });
+		unrelated.appendCustomEntry(
+			ACCOUNT_SELECTION_ENTRY_TYPE,
+			createAccountSelectionEntryData(unrelatedId, { anthropic: "other" }),
+		);
+		persistSession(unrelated);
+		const unrelatedFile = unrelated.getSessionFile();
+		assert.ok(unrelatedFile);
+
+		const now = Date.now() / 1_000;
+		await utimes(sourceFile, now - 30, now - 30);
+		await utimes(invalidFile, now - 20, now - 20);
+		await utimes(unrelatedFile, now - 10, now - 10);
+
+		const currentId = randomUUID();
+		const current = SessionManager.create(project, sessionDir, { id: currentId });
+		current.appendCustomEntry(
+			ACCOUNT_SELECTION_ENTRY_TYPE,
+			createAccountSelectionEntryData(currentId, { anthropic: "current" }),
+		);
+		persistSession(current);
+		const loaded = await loadNewestProjectAccountSelections({
+			cwd: project,
+			sessionManager: current,
+		});
+		assert.equal(loaded.status, "loaded");
+		if (loaded.status === "loaded") {
+			assert.deepEqual({ ...loaded.selections }, { anthropic: "work", "future.provider": null });
+		}
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+
+test("recent account selection loading reports invalid state when no candidate is usable", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-accounts-invalid-recent-selection-"));
+	const project = join(root, "project");
+	const sessionDir = join(root, "sessions");
+	try {
+		const invalidId = randomUUID();
+		const invalid = SessionManager.create(project, sessionDir, { id: invalidId });
+		invalid.appendCustomEntry(ACCOUNT_SELECTION_ENTRY_TYPE, {
+			version: 2,
+			sessionId: invalidId,
+			providers: { anthropic: "invalid" },
+		});
+		persistSession(invalid);
+
+		const current = SessionManager.create(project, sessionDir, { id: randomUUID() });
+		const loaded = await loadNewestProjectAccountSelections({
+			cwd: project,
+			sessionManager: current,
+		});
+		assert.equal(loaded.status, "invalid");
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+
+test("recent selection loading runs only for genuinely new session starts", () => {
+	assert.equal(shouldLoadRecentAccountSelections("new", "/existing/session.jsonl"), true);
+	assert.equal(shouldLoadRecentAccountSelections("startup", undefined), true);
+	assert.equal(shouldLoadRecentAccountSelections("resume", undefined), false);
+	assert.equal(shouldLoadRecentAccountSelections("switch", undefined), false);
+});
+
+test("recent selection loading honors lifecycle cancellation", async () => {
+	const controller = new AbortController();
+	controller.abort(new DOMException("Session replaced", "AbortError"));
+	await assert.rejects(
+		loadNewestProjectAccountSelections(
+			{
+				cwd: process.cwd(),
+				sessionManager: SessionManager.inMemory(process.cwd()),
+			},
+			controller.signal,
+		),
+		(error: Error) => error.name === "AbortError",
+	);
 });
 
 test("session account selections survive reopen while copied forks initialize independently", async () => {

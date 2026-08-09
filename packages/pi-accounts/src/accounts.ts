@@ -34,9 +34,11 @@ import {
 	ACCOUNT_SELECTION_ENTRY_TYPE,
 	cloneAccountSelections,
 	createAccountSelectionEntryData,
+	loadNewestProjectAccountSelections,
 	type ProviderAccountSelections,
 	restoreAccountSelections,
 	setAccountSelection,
+	shouldLoadRecentAccountSelections,
 } from "./session-selection.js";
 
 export {
@@ -53,7 +55,9 @@ export {
 } from "./account-store.js";
 
 export const ACCOUNTS_STATUS_KEY = "accounts";
+export const ACCOUNT_SWITCH_SHORTCUT = "ctrl+alt+a";
 export const FAIL_CLOSED_API_KEY = RUNTIME_FAIL_CLOSED_API_KEY;
+const RECENT_SELECTION_LOOKUP_TIMEOUT_MS = 500;
 export const DEFAULT_PI_LOGIN_LABEL = "(default pi login)";
 
 export type AccountsDependencies = {
@@ -128,6 +132,7 @@ export default function accountsExtension(
 	const initializeOwner = async (
 		owner: SessionSelectionOwner,
 		ctx: ExtensionContext,
+		reason: string,
 	): Promise<void> => {
 		const restored = restoreAccountSelections(ctx.sessionManager.getEntries(), owner.sessionId);
 		if (restored.status === "invalid") {
@@ -139,6 +144,29 @@ export default function accountsExtension(
 			restored.status === "loaded"
 				? restored.selections
 				: cloneAccountSelections(Object.create(null) as ProviderAccountSelections);
+		if (
+			restored.status === "missing" &&
+			shouldLoadRecentAccountSelections(reason, ctx.sessionManager.getSessionFile())
+		) {
+			let recent: Awaited<ReturnType<typeof loadNewestProjectAccountSelections>>;
+			try {
+				recent = await loadNewestProjectAccountSelections(
+					ctx,
+					AbortSignal.any([owner.signal, AbortSignal.timeout(RECENT_SELECTION_LOOKUP_TIMEOUT_MS)]),
+				);
+			} catch {
+				if (!isOwnerCurrent(owner)) return;
+				recent = { status: "missing" };
+			}
+			if (!isOwnerCurrent(owner)) return;
+			if (recent.status === "invalid") {
+				owner.error =
+					"The newest reusable account selection for this project is invalid. Choose an account or default from /accounts to recover.";
+				ctx.ui.notify(owner.error, "error");
+				return;
+			}
+			if (recent.status === "loaded") selections = recent.selections;
+		}
 		const missingProviders = providers.filter(
 			(provider) => !Object.hasOwn(selections, provider.id),
 		);
@@ -147,15 +175,18 @@ export default function accountsExtension(
 			return;
 		}
 		try {
-			const data = await store.readAsync();
-			if (!isOwnerCurrent(owner)) return;
-			for (const provider of missingProviders) {
-				selections = setAccountSelection(
-					selections,
-					provider.id,
-					data.providers[provider.id]?.active ?? null,
-				);
+			if (missingProviders.length > 0) {
+				const data = await store.readAsync();
+				if (!isOwnerCurrent(owner)) return;
+				for (const provider of missingProviders) {
+					selections = setAccountSelection(
+						selections,
+						provider.id,
+						data.providers[provider.id]?.active ?? null,
+					);
+				}
 			}
+			if (!isOwnerCurrent(owner)) return;
 			owner.sessionManager.appendCustomEntry(
 				ACCOUNT_SELECTION_ENTRY_TYPE,
 				createAccountSelectionEntryData(owner.sessionId, selections),
@@ -170,7 +201,7 @@ export default function accountsExtension(
 		}
 	};
 
-	const startSessionOwner = (ctx: ExtensionContext): SessionSelectionOwner => {
+	const startSessionOwner = (ctx: ExtensionContext, reason = "startup"): SessionSelectionOwner => {
 		const previous = sessionOwners.get(ctx.sessionManager);
 		if (previous) {
 			previous.controller.abort(new DOMException("Accounts session replaced", "AbortError"));
@@ -199,7 +230,7 @@ export default function accountsExtension(
 			syncTasks: new Map(),
 		};
 		sessionOwners.set(ctx.sessionManager, owner);
-		owner.ready = initializeOwner(owner, ctx);
+		owner.ready = initializeOwner(owner, ctx, reason);
 		return owner;
 	};
 
@@ -317,6 +348,10 @@ export default function accountsExtension(
 		if (isOwnerCurrent(owner)) updateStatus(ctx, owner.results);
 	};
 
+	const getMenuOwner = (owner: SessionSelectionOwner, ctx: ExtensionContext) => ({
+		signal: owner.signal,
+		isCurrent: () => isOwnerCurrent(owner) && ctx.isIdle(),
+	});
 	pi.registerCommand(
 		"accounts",
 		createAccountCommand(
@@ -325,12 +360,42 @@ export default function accountsExtension(
 			syncProvider,
 			persistSelection,
 			ensureSessionOwner,
-			(owner) => ({ signal: owner.signal, isCurrent: () => isOwnerCurrent(owner) }),
+			getMenuOwner,
 		),
 	);
+	pi.registerShortcut(ACCOUNT_SWITCH_SHORTCUT, {
+		description: "Switch the current provider account",
+		handler: async (ctx) => {
+			if (!ensureAccountsIdle(ctx)) return;
+			const owner = await ensureSessionOwner(ctx);
+			const menuOwner = getMenuOwner(owner, ctx);
+			if (!menuOwner.isCurrent()) return;
+			const { showCurrentProviderAccountSelector } = await import("./account-menu.js");
+			if (!menuOwner.isCurrent()) return;
+			await showCurrentProviderAccountSelector(
+				ctx,
+				store,
+				adapters,
+				owner,
+				(adapter, name, signal, isCurrent) =>
+					switchAccount(
+						ctx,
+						store,
+						adapter,
+						name,
+						signal,
+						syncProvider,
+						persistSelection,
+						owner,
+						isCurrent,
+					),
+				menuOwner,
+			);
+		},
+	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		const owner = startSessionOwner(ctx);
+	pi.on("session_start", async (event, ctx) => {
+		const owner = startSessionOwner(ctx, event.reason);
 		if (migrationNotice) {
 			ctx.ui.notify(migrationNotice, "warning");
 			migrationNotice = undefined;
@@ -413,13 +478,17 @@ function createAccountCommand(
 	syncProvider: SyncProvider,
 	persistSelection: PersistSelection,
 	ensureSessionOwner: (ctx: ExtensionContext) => Promise<SessionSelectionOwner>,
-	getMenuOwner: (owner: SessionSelectionOwner) => { signal: AbortSignal; isCurrent(): boolean },
+	getMenuOwner: (
+		owner: SessionSelectionOwner,
+		ctx: ExtensionContext,
+	) => { signal: AbortSignal; isCurrent(): boolean },
 ) {
 	return {
 		description: "Open the interactive OAuth account manager",
 		handler: async (_args: string, ctx: ExtensionCommandContext) => {
+			if (!ensureAccountsIdle(ctx)) return;
 			const owner = await ensureSessionOwner(ctx);
-			const menuOwner = getMenuOwner(owner);
+			const menuOwner = getMenuOwner(owner, ctx);
 			if (!menuOwner.isCurrent()) return;
 			const { showAccountsMenu } = await import("./account-menu.js");
 			if (!menuOwner.isCurrent()) return;
@@ -540,7 +609,7 @@ async function loginAccount(
 }
 
 async function switchAccount(
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 	store: AccountStore,
 	adapter: AccountProviderAdapter,
 	nameArg: string,
@@ -660,6 +729,12 @@ async function removeAccount(
 		}
 	}
 	ctx.ui.notify(`Removed ${adapter.displayName} account "${parsed.name}".`, "info");
+}
+
+function ensureAccountsIdle(ctx: ExtensionContext): boolean {
+	if (ctx.isIdle()) return true;
+	ctx.ui.notify("Wait for the active agent run to finish before changing accounts.", "warning");
+	return false;
 }
 
 function validateProviderSet(

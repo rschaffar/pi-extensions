@@ -13,7 +13,9 @@ Each Pi session keeps its own selection for every provider, and choosing `defaul
 
 - Manages named OpenAI Codex, Anthropic Claude Pro/Max, GitHub Copilot, Kimi For Coding, OpenRouter, Radius, and xAI OAuth accounts through `/accounts`.
 - Selects an account—or Pi's default login—independently for each provider and Pi session.
+- Opens the current model provider's account selector with the portable `Ctrl+Alt+A` shortcut.
 - Restores session selections after resume or reload while allowing concurrent sessions to use different accounts.
+- Seeds a genuinely new session from the newest usable same-project selection without copying credentials.
 - Applies provider-specific credentials, endpoints, headers, and model availability through Pi's built-in providers.
 - Refreshes rotating credentials and verifies the effective authentication before reporting success.
 - Offers only the verified active OAuth credential to compatible in-process consumers.
@@ -82,6 +84,8 @@ Back returns through provider and account screens, and Escape closes the root.
 Print and JSON modes do not provide account-manager output.
 Extra text after `/accounts` is ignored.
 OAuth challenges, account names, and replacement or removal confirmations use dedicated dialogs.
+Press `Ctrl+Alt+A` to open the account selector directly for the current model provider.
+The command and shortcut reject account changes while an agent run is active.
 
 When no accounts are saved yet, the menu starts with login:
 
@@ -154,6 +158,8 @@ Session selections are stored as versioned, non-model custom entries in Pi's ses
 The entries contain only provider IDs and account names, not OAuth credentials.
 The owning Pi session ID prevents a fork or clone from treating copied parent entries as its own selection.
 Resume and reload restore entries owned by the same session, while `/tree` navigation keeps one session-wide selection instead of changing authentication by branch.
+A genuinely new session with no owned snapshot scans recent session files from the same project and copies the newest usable non-secret selection into its own entry.
+The lookup has a 500 ms startup deadline, excludes the current file, and bounds metadata candidate count, concurrency, state reads, individual file size, total bytes, and lifecycle cancellation.
 A malformed matching selection entry fails managed providers closed until `/accounts` writes a valid snapshot; recovery defaults any other managed provider whose selection could not be trusted.
 
 The extension implements the versioned `oauth:credential-source:v1` protocol for compatible current-account consumers such as usage reporters.
@@ -194,10 +200,11 @@ The canonical file is:
 
 When `PI_CODING_AGENT_DIR` is set, the file is stored at `$PI_CODING_AGENT_DIR/pi-accounts.json` instead.
 Its versioned structure keeps shared credential maps and a compatibility default under separate provider IDs.
-The legacy provider-level `active` value seeds a session that has no owned selection entry, but login, switch, and `default` actions no longer change it.
+The legacy provider-level `active` value remains a compatibility fallback, but login, switch, and `default` actions no longer change it.
 A resumed session created before session-local selection support snapshots the current compatibility default once because its historical account choice cannot be inferred.
-Every new session snapshots that compatibility default; forked and cloned sessions do not inherit copied parent selections because their new IDs do not own those entries.
-Removing the credential named by the compatibility default clears that default so new sessions are not seeded with a missing account.
+A genuinely new session prefers the newest usable same-project selection and uses compatibility defaults when no snapshot is found before the deadline or for providers missing from that snapshot.
+Forked and cloned sessions do not trust copied parent selections because their new IDs do not own those entries.
+Removing the credential named by the compatibility default clears that default so fallback initialization is not seeded with a missing account.
 Credential values are private and must not be committed.
 When neither canonical nor legacy storage exists, reads return an empty store without creating a directory or file.
 The first account change creates the private canonical file.
@@ -236,7 +243,7 @@ It is excluded from active workspace checks, version bumps, and publishing.
 - It does not rotate accounts automatically, evade quotas, or report usage.
 - It does not support arbitrary custom providers.
 - Live OAuth login and model requests depend on provider service availability and account entitlement.
-- Sessions created before this behavior cannot recover a historical per-session choice and therefore use the shared compatibility default for their first snapshot.
+- Resumed legacy sessions cannot recover a historical per-session choice and therefore use the shared compatibility default for their first snapshot.
 
 ## 🗂️ Package layout
 
