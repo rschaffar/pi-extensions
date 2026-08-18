@@ -1,18 +1,17 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
-import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import {
 	BROKER_CREDENTIAL_FD,
 	brokerCredentialEnvironment,
 	serializeBrokerCredentials,
 } from "./broker-credentials.js";
+import { CHILD_AUTH_BOOTSTRAP_PATH, ChildAuthProcessHandoff } from "./child-auth.js";
 import { CHILD_COMMUNICATION_TOOL_NAMES } from "./child-communication-tools.js";
+import { resolvePiInvocation } from "./pi-invocation.js";
 import type { ChildControl, ChildRequest, ChildResult } from "./types.js";
 
-const CORE_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 const MAX_OUTPUT_BYTES = 32 * 1024;
@@ -89,6 +88,8 @@ export function buildPiArgs(request: ChildRequest): string[] {
 		"--no-extensions",
 		"--no-skills",
 		"--no-prompt-templates",
+		"-e",
+		CHILD_AUTH_BOOTSTRAP_PATH,
 		"-e",
 		childCommunicationBridgePath(),
 		"--model",
@@ -228,6 +229,7 @@ async function executeProcess(
 		let forceClose: NodeJS.Timeout | undefined;
 		let escalation: NodeJS.Timeout | undefined;
 		let termination: Promise<void> | undefined;
+		let authHandoff: ChildAuthProcessHandoff | undefined;
 
 		const finish = (code: number, launchError?: string) => {
 			if (settled || finishRequested) return;
@@ -240,6 +242,7 @@ async function executeProcess(
 				if (escalation) clearTimeout(escalation);
 				request.signal.removeEventListener("abort", onAbort);
 				rejectPendingCommands(new Error("Subagent RPC process closed."));
+				authHandoff?.close();
 				resolve({ code, cancelled, timedOut, completed, launchError });
 			};
 			if (termination) void termination.then(complete, complete);
@@ -285,7 +288,7 @@ async function executeProcess(
 				cwd: request.cwd,
 				detached: globalThis.process.platform !== "win32",
 				shell: false,
-				stdio: ["pipe", "pipe", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe", "pipe", "pipe", "pipe", "pipe"],
 				env: {
 					...globalThis.process.env,
 					...brokerCredentialEnvironment(),
@@ -296,6 +299,13 @@ async function executeProcess(
 			});
 		} catch (error) {
 			finish(1, error instanceof Error ? error.message : String(error));
+			return;
+		}
+		try {
+			authHandoff = new ChildAuthProcessHandoff(process, request.auth);
+		} catch {
+			errorMessage = "Subagent parent runtime authentication pipes are unavailable.";
+			terminate(1);
 			return;
 		}
 
@@ -355,37 +365,42 @@ async function executeProcess(
 		process.once("spawn", () => {
 			spawned = true;
 			if (settled || cancelled) return;
-			void sendCommand(
-				{ type: "prompt", message: `Task: ${request.task}` },
-				() => {
-					if (settled || terminating || request.signal.aborted) {
-						throw new Error("Subagent RPC prompt was superseded.");
-					}
-					ready = true;
-					if (timeoutMs !== undefined) {
-						deadline = setTimeout(() => {
-							timedOut = true;
-							terminate(124);
-						}, timeoutMs);
-						deadline.unref();
-					}
-					const control: ChildControl = {
-						send: async (message, signal) => {
-							if (!ready || completed || terminating) {
-								throw new Error("Subagent job is no longer accepting messages.");
-							}
-							await sendCommand({ type: "steer", message }, undefined, signal);
-						},
-					};
-					request.onControl?.(control);
-				},
-				request.signal,
-			).catch((error) => {
+			void (async () => {
+				await authHandoff?.apply(request.auth, request.signal);
+				if (settled || terminating || request.signal.aborted) return;
+				await sendCommand(
+					{ type: "prompt", message: `Task: ${request.task}` },
+					() => {
+						if (settled || terminating || request.signal.aborted) {
+							throw new Error("Subagent RPC prompt was superseded.");
+						}
+						ready = true;
+						if (timeoutMs !== undefined) {
+							deadline = setTimeout(() => {
+								timedOut = true;
+								terminate(124);
+							}, timeoutMs);
+							deadline.unref();
+						}
+						const control: ChildControl = {
+							send: async (message, auth, signal) => {
+								if (!ready || completed || terminating) {
+									throw new Error("Subagent job is no longer accepting messages.");
+								}
+								await authHandoff?.apply(auth, signal);
+								if (!ready || completed || terminating) {
+									throw new Error("Subagent job is no longer accepting messages.");
+								}
+								await sendCommand({ type: "steer", message }, undefined, signal);
+							},
+						};
+						request.onControl?.(control);
+					},
+					request.signal,
+				);
+			})().catch(() => {
 				if (settled || terminating) return;
-				errorMessage = truncateText(
-					error instanceof Error ? error.message : String(error),
-					MAX_ERROR_BYTES,
-				).text;
+				errorMessage = "Subagent parent runtime authentication handoff failed.";
 				terminate(1);
 			});
 		});
@@ -484,34 +499,6 @@ async function executeProcess(
 		limitations,
 		truncated,
 	};
-}
-
-function resolvePiInvocation(args: string[]): { command: string; args: string[] } {
-	const packageDirectory = fs.realpathSync(getPackageDir());
-	const manifestPath = path.join(packageDirectory, "package.json");
-	const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
-		name?: string;
-		bin?: { pi?: string };
-	};
-	if (manifest.name !== CORE_PACKAGE_NAME || typeof manifest.bin?.pi !== "string") {
-		throw new Error("Loaded Pi core package does not declare a valid bin.pi entry.");
-	}
-	const declared = manifest.bin.pi;
-	if (path.isAbsolute(declared)) throw new Error("Pi core bin.pi must be package-relative.");
-	const cliPath = fs.realpathSync(path.resolve(packageDirectory, declared));
-	const relative = path.relative(packageDirectory, cliPath);
-	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-		throw new Error("Pi core bin.pi escapes its package directory.");
-	}
-	if (!fs.statSync(cliPath).isFile()) throw new Error("Pi core bin.pi is not a file.");
-	if (
-		globalThis.process.versions.bun &&
-		/^pi(?:\.exe)?$/iu.test(path.basename(globalThis.process.execPath)) &&
-		path.dirname(fs.realpathSync(globalThis.process.execPath)) === packageDirectory
-	) {
-		return { command: globalThis.process.execPath, args };
-	}
-	return { command: globalThis.process.execPath, args: [cliPath, ...args] };
 }
 
 function signalPosixProcess(process: ChildProcess, signal: NodeJS.Signals): void {

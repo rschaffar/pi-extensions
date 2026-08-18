@@ -18,6 +18,7 @@ import { test } from "vitest";
 
 const packageRoot = resolve("packages/pi-subagents");
 const builderUrl = pathToFileURL(join(packageRoot, "scripts/build-runtime.mjs")).href;
+const childAuthSource = "src/child-auth-bootstrap.ts";
 const childBridgeSource = "src/child-communication-bridge.ts";
 
 type BuildMetadata = {
@@ -66,6 +67,11 @@ function validMetadata(): BuildMetadata {
 				],
 				inputs: { "src/index.ts": {}, "src/subagents.ts": {} },
 			},
+			"dist/child-auth-bootstrap.js": {
+				entryPoint: childAuthSource,
+				imports: [{ path: "dist/chunks/shared.js", kind: "import-statement" }],
+				inputs: { [childAuthSource]: {} },
+			},
 			"dist/child-communication-bridge.js": {
 				entryPoint: childBridgeSource,
 				imports: [{ path: "dist/chunks/shared.js", kind: "import-statement" }],
@@ -79,7 +85,7 @@ function validMetadata(): BuildMetadata {
 	};
 }
 
-test("eager graph validation keeps the child bridge separate and packages external", async () => {
+test("eager graph validation keeps child entries separate and packages external", async () => {
 	const builder = await loadBuilder();
 	assert.doesNotThrow(() => builder.validateEagerGraph(validMetadata()));
 
@@ -145,7 +151,7 @@ test("runtime builds are deterministic, mapped, external, and remove stale outpu
 		assert.deepEqual(await snapshotDirectory(first), await snapshotDirectory(second));
 		assert.equal((await listFiles(second)).includes("chunks/stale.js"), false);
 		const files = await listFiles(first);
-		for (const entry of ["index", "child-communication-bridge"]) {
+		for (const entry of ["index", "child-auth-bootstrap", "child-communication-bridge"]) {
 			assert.ok(files.includes(`${entry}.ts`));
 			assert.ok(files.includes(`${entry}.ts.map`));
 			assert.equal(files.includes(`${entry}.js`), false);
@@ -163,6 +169,7 @@ test("runtime builds are deterministic, mapped, external, and remove stale outpu
 			}
 		}
 		const mainSource = await readFile(join(first, "index.ts"), "utf8");
+		assert.match(mainSource, /"\.\/child-auth-bootstrap\.ts"/u);
 		assert.match(mainSource, /"\.\/child-communication-bridge\.ts"/u);
 	} finally {
 		await rm(root, { force: true, recursive: true });

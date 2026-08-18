@@ -399,37 +399,78 @@ test("rejects invalid spawn arguments and nesting before child launch", async ()
 	assert.equal(launches, 0);
 });
 
-test("rejects parent-only model providers and credentials before child launch", async () => {
-	for (const [modelRegistry, expected] of [
-		[
-			{
-				getProviderAuthStatus: () => ({ configured: true, source: "runtime" as const }),
-				getRegisteredProviderIds: () => [],
+test("inherits and refreshes parent runtime authentication for a running child", async () => {
+	let runtimeKey = "first-runtime-key";
+	let request!: ChildRequest;
+	const refreshedAuth: ChildRequest["auth"][] = [];
+	const modelRegistry = {
+		getProviderAuthStatus: () => ({ configured: true, source: "runtime" as const }),
+		getProviderAuth: async () => ({
+			auth: { apiKey: runtimeKey },
+			source: "runtime" as const,
+		}),
+		getRegisteredProviderIds: () => ["test-provider"],
+		getRegisteredProviderConfig: () => ({ baseUrl: "https://selected.example.test" }),
+	};
+	const { mock, context } = await setup(
+		{
+			runChild: async (candidate) => {
+				request = candidate;
+				candidate.onControl?.({
+					async send(_message, auth) {
+						refreshedAuth.push(auth);
+					},
+				});
+				return waitForCancellation(candidate);
 			},
-			/process-local runtime API key/i,
-		],
-		[
-			{
+		},
+		{},
+		{ modelRegistry },
+	);
+	const spawned = await spawnJob(mock, context, "use selected account");
+	await Promise.resolve();
+	assert.deepEqual(request.auth.providers, [
+		{
+			provider: "test-provider",
+			auth: { apiKey: "first-runtime-key" },
+			config: { baseUrl: "https://selected.example.test" },
+		},
+	]);
+
+	runtimeKey = "second-runtime-key";
+	await tool(mock, "subagent_send").execute(
+		"refresh-auth",
+		{ recipient: spawned.details.jobId, message: "continue" },
+		undefined,
+		undefined,
+		context.ctx,
+	);
+	assert.equal(refreshedAuth[0]?.providers[0]?.auth.apiKey, "second-runtime-key");
+	await cancelJob(mock, context, String(spawned.details.jobId));
+});
+
+test("rejects extension-only providers without transferable runtime authentication", async () => {
+	let launches = 0;
+	const { mock, context } = await setup(
+		{
+			runChild: async () => {
+				launches++;
+				return completed("unexpected");
+			},
+		},
+		{},
+		{
+			modelRegistry: {
 				getProviderAuthStatus: () => ({ configured: true, source: "stored" as const }),
 				getRegisteredProviderIds: () => ["test-provider"],
 			},
-			/children disable parent extensions/i,
-		],
-	] as const) {
-		let launches = 0;
-		const { mock, context } = await setup(
-			{
-				runChild: async () => {
-					launches++;
-					return completed("unexpected");
-				},
-			},
-			{},
-			{ modelRegistry },
-		);
-		await assert.rejects(() => spawnJob(mock, context, "must not launch"), expected);
-		assert.equal(launches, 0);
-	}
+		},
+	);
+	await assert.rejects(
+		() => spawnJob(mock, context, "must not launch"),
+		/children disable parent extensions/i,
+	);
+	assert.equal(launches, 0);
 });
 
 test("delivers child questions, interrupts parent waits, and returns plain-text replies", async () => {
@@ -688,7 +729,7 @@ test("preserves a main request when cancellation races with queued RPC delivery"
 		runChild: async (candidate) => {
 			request = candidate;
 			candidate.onControl?.({
-				async send(message, signal) {
+				async send(message, _auth, signal) {
 					assert.equal(signal, undefined);
 					steered = message;
 					resolveSendStarted();

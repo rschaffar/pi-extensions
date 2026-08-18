@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ChildAuthSnapshot } from "./child-auth-protocol.js";
 import { COMPLETION_MESSAGE_TYPE } from "./completion-renderer.js";
 import {
 	type BrokerSendAcknowledgement,
@@ -28,6 +29,7 @@ interface StopRequest {
 interface InternalJob extends JobSummary {
 	controller: AbortController;
 	tools: string[];
+	authProvider: string;
 	terminal: Promise<void>;
 	resolveTerminal: () => void;
 	task?: Promise<void>;
@@ -61,6 +63,8 @@ export interface StartJobInput {
 	task: string;
 	tools: string[];
 	model: string;
+	authProvider: string;
+	auth: ChildAuthSnapshot;
 	thinkingLevel: SubagentThinkingLevel;
 	cwd: string;
 	timeout?: number;
@@ -150,6 +154,7 @@ export class SubagentRuntime {
 			...(input.timeout !== undefined ? { timeout: input.timeout } : {}),
 			controller,
 			tools: [...input.tools],
+			authProvider: input.authProvider,
 			terminal,
 			resolveTerminal,
 			controlReady,
@@ -177,6 +182,7 @@ export class SubagentRuntime {
 					task: input.task,
 					tools: [...input.tools],
 					model: input.model,
+					auth: input.auth,
 					thinkingLevel: input.thinkingLevel,
 					cwd: input.cwd,
 					timeout: input.timeout,
@@ -209,9 +215,18 @@ export class SubagentRuntime {
 		};
 	}
 
+	modelProviderForJob(jobId: string): string {
+		const job = this.requireJob(jobId);
+		if (isTerminal(job.state) || job.stopRequest) {
+			throw new Error("Subagent job is no longer active.");
+		}
+		return job.authProvider;
+	}
+
 	async sendToJob(
 		jobId: string,
 		message: string,
+		auth: ChildAuthSnapshot,
 		signal?: AbortSignal,
 	): Promise<BrokerSendAcknowledgement> {
 		const job = this.requireJob(jobId);
@@ -236,7 +251,7 @@ export class SubagentRuntime {
 				throw new Error("Subagent job is no longer active.");
 			}
 			deliveryStarted = true;
-			await control.send(mainRequestMessage(job.jobId, acknowledgement.requestId, message));
+			await control.send(mainRequestMessage(job.jobId, acknowledgement.requestId, message), auth);
 			if (isTerminal(job.state) || job.stopRequest || job.generation !== this.generation) {
 				throw new Error("Subagent job is no longer active.");
 			}

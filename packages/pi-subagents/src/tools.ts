@@ -1,6 +1,8 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import { createChildAuthSnapshot } from "./child-auth.js";
+import { CHILD_AUTH_PROTOCOL } from "./child-auth-protocol.js";
 import {
 	type BrokerInboundMessage,
 	MAX_IDENTIFIER_LENGTH,
@@ -144,7 +146,8 @@ export function registerSubagentTools(
 			assertNotNested();
 			const task = validateTask(params.task, "subagent_spawn");
 			const tools = resolveTools(params.tools);
-			const model = resolveChildModel(ctx);
+			const childRuntime = await resolveChildRuntime(ctx);
+			throwIfAborted(signal, "Subagent spawn was cancelled");
 			const thinkingLevel = resolveThinkingLevel(
 				params.thinkingLevel ?? ctx.thinkingLevel ?? pi.getThinkingLevel(),
 			);
@@ -153,7 +156,9 @@ export function registerSubagentTools(
 				runtime.start({
 					task,
 					tools,
-					model,
+					model: childRuntime.model,
+					authProvider: childRuntime.provider,
+					auth: childRuntime.auth,
 					thinkingLevel,
 					cwd: ctx.cwd,
 					timeout: params.timeout,
@@ -213,14 +218,19 @@ export function registerSubagentTools(
 			"Use subagent_send to send one request to an active job or answer one pending child request. For a new request, provide recipient and omit requestId. To answer a request, provide requestId and omit recipient. Provide exactly one of recipient or requestId. An accepted new request interrupts any active child response wait so delivery can proceed without consuming the child's original request.",
 		promptSnippet: "Use subagent_send to send or answer one subagent message",
 		parameters: SendParameters,
-		async execute(_toolCallId, params, signal) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			throwIfAborted(signal, "Subagent send was cancelled");
 			const selection = resolveMainSendArguments(params);
 			if (selection.kind === "request") {
 				if (selection.recipient === "main") {
 					throw new Error('The main agent must use an active job ID as recipient, not "main".');
 				}
-				return toolResult(await runtime.sendToJob(selection.recipient, selection.message, signal));
+				const provider = runtime.modelProviderForJob(selection.recipient);
+				const auth = await createChildAuthSnapshot(ctx.modelRegistry, [provider]);
+				throwIfAborted(signal, "Subagent send was cancelled");
+				return toolResult(
+					await runtime.sendToJob(selection.recipient, selection.message, auth, signal),
+				);
 			}
 			return toolResult(broker.replyFromMain(selection.requestId, selection.message));
 		},
@@ -311,22 +321,38 @@ function resolveTools(value: unknown): string[] {
 	return tools;
 }
 
-function resolveChildModel(ctx: ExtensionContext): string {
+async function resolveChildRuntime(ctx: ExtensionContext): Promise<{
+	model: string;
+	provider: string;
+	auth: Awaited<ReturnType<typeof createChildAuthSnapshot>>;
+}> {
 	const model = ctx.model;
-	if (!model)
+	if (!model) {
 		throw new Error("Subagent model is unavailable because no main-agent model is selected.");
+	}
 	const provider = sanitizeTerminalText(model.provider).slice(0, 128);
-	if (ctx.modelRegistry.getRegisteredProviderIds().includes(model.provider)) {
+	let source: ReturnType<ExtensionContext["modelRegistry"]["getProviderAuthStatus"]>["source"];
+	try {
+		source = ctx.modelRegistry.getProviderAuthStatus(model.provider).source;
+	} catch {
+		throw new Error(`Subagent model provider ${provider} authentication is unavailable.`);
+	}
+	const auth =
+		source === "runtime"
+			? await createChildAuthSnapshot(ctx.modelRegistry, [model.provider])
+			: { version: CHILD_AUTH_PROTOCOL, providers: [] };
+	if (source === "runtime" && auth.providers.length !== 1) {
+		throw new Error(`Subagent model provider ${provider} runtime authentication is unavailable.`);
+	}
+	if (
+		source !== "runtime" &&
+		ctx.modelRegistry.getRegisteredProviderIds().includes(model.provider)
+	) {
 		throw new Error(
 			`Subagent model provider ${provider} is unavailable because children disable parent extensions.`,
 		);
 	}
-	if (ctx.modelRegistry.getProviderAuthStatus(model.provider).source === "runtime") {
-		throw new Error(
-			`Subagent model provider ${provider} uses a process-local runtime API key. Configure stored or environment credentials that child processes can read.`,
-		);
-	}
-	return `${model.provider}/${model.id}`;
+	return { model: `${model.provider}/${model.id}`, provider: model.provider, auth };
 }
 
 function resolveThinkingLevel(value: unknown): SubagentThinkingLevel {

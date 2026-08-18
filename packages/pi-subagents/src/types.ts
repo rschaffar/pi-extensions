@@ -1,4 +1,5 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { ChildAuthSnapshot } from "./child-auth-protocol.js";
 
 export const JOB_STATES = [
 	"queued",
@@ -57,13 +58,14 @@ export interface BrokerCredentials {
 }
 
 export interface ChildControl {
-	send(message: string, signal?: AbortSignal): Promise<void>;
+	send(message: string, auth: ChildAuthSnapshot, signal?: AbortSignal): Promise<void>;
 }
 
 export interface ChildRequest {
 	task: string;
 	tools: string[];
 	model: string;
+	auth: ChildAuthSnapshot;
 	thinkingLevel: SubagentThinkingLevel;
 	cwd: string;
 	timeout?: number;

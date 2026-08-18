@@ -5,6 +5,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, test, vi } from "vitest";
+import { CHILD_AUTH_BOOTSTRAP_PATH } from "../src/child-auth.js";
+import { CHILD_AUTH_PROTOCOL, type ChildAuthSnapshot } from "../src/child-auth-protocol.js";
 import {
 	buildPiArgs,
 	childCommunicationBridgePath,
@@ -41,7 +43,9 @@ test("buildPiArgs isolates the RPC child and preserves selected communication to
 		"--no-prompt-templates",
 		"-e",
 	]);
-	assert.equal(args[7], childCommunicationBridgePath());
+	assert.equal(args[7], CHILD_AUTH_BOOTSTRAP_PATH);
+	assert.equal(args[8], "-e");
+	assert.equal(args[9], childCommunicationBridgePath());
 	assert.equal(args[args.indexOf("--model") + 1], "test-provider/test-model");
 	assert.equal(args[args.indexOf("--thinking") + 1], "medium");
 	assert.ok(args.includes("--no-approve"));
@@ -135,7 +139,7 @@ async function handle(command) {
 	assert.match(result.limitations.join("\n"), /malformed or oversized/i);
 });
 
-test("runChild exposes RPC steering only after prompt acceptance", async () => {
+test("runChild refreshes runtime auth before accepted RPC steering", async () => {
 	installFakePi(`
 async function handle(command) {
   if (command.type === "prompt") {
@@ -144,7 +148,7 @@ async function handle(command) {
   }
   if (command.type === "steer") {
     respond(command);
-    event(message("answered: " + command.message));
+    event(message("answered with " + latestAuthRequest.snapshot.providers[0].auth.apiKey + ": " + command.message));
     event({ type: "agent_settled" });
   }
 }
@@ -155,11 +159,17 @@ async function handle(command) {
 	});
 	const work = runChild(childRequest({ onControl: resolveControl }));
 	const control = await controlReady;
-	await control.send("question from main");
+	await control.send("question from main", {
+		version: CHILD_AUTH_PROTOCOL,
+		providers: [{ provider: "test-provider", auth: { apiKey: "refreshed-key" } }],
+	});
 	const result = await work;
 	assert.equal(result.state, "completed");
-	assert.equal(result.result, "answered: question from main");
-	await assert.rejects(() => control.send("late"), /no longer accepting|no longer active/i);
+	assert.equal(result.result, "answered with refreshed-key: question from main");
+	await assert.rejects(
+		() => control.send("late", emptyAuth()),
+		/no longer accepting|no longer active/i,
+	);
 });
 
 test("runChild surfaces an RPC steering rejection without terminating accepted work", async () => {
@@ -181,7 +191,7 @@ async function handle(command) {
 	});
 	const work = runChild(childRequest({ signal: controller.signal, onControl: resolveControl }));
 	const control = await controlReady;
-	await assert.rejects(() => control.send("question"), /steer rejected/i);
+	await assert.rejects(() => control.send("question", emptyAuth()), /steer rejected/i);
 	controller.abort();
 	assert.equal((await work).state, "cancelled");
 });
@@ -203,7 +213,10 @@ setInterval(() => {}, 1000);
 	});
 	const work = runChild(childRequest({ signal: controller.signal, onControl: resolveControl }));
 	const control = await controlReady;
-	await assert.rejects(() => control.send("question after stdin closed"), /EPIPE|stdin|write/iu);
+	await assert.rejects(
+		() => control.send("question after stdin closed", emptyAuth()),
+		/EPIPE|stdin|write/iu,
+	);
 	controller.abort();
 	assert.equal((await work).state, "cancelled");
 });
@@ -225,7 +238,7 @@ setInterval(() => {}, 1000);
 	);
 	const control = await controlReady;
 	const sendController = new AbortController();
-	const pending = control.send("unacknowledged question", sendController.signal);
+	const pending = control.send("unacknowledged question", emptyAuth(), sendController.signal);
 	sendController.abort();
 	await assert.rejects(pending, (error: Error) => error.name === "AbortError");
 	processController.abort();
@@ -248,7 +261,8 @@ async function handle(command) {
 	assert.match(result.limitations.join("\n"), /truncated/i);
 });
 
-test("passes broker credentials through a private descriptor outside the initial environment", async () => {
+test("passes broker and runtime auth credentials through private descriptors", async () => {
+	const authSecret = "parent-runtime-secret";
 	installFakePi(`
 async function handle(command) {
   if (command.type !== "prompt") return;
@@ -256,20 +270,36 @@ async function handle(command) {
   const initialEnvironment = process.platform === "linux"
     ? fs.readFileSync("/proc/self/environ")
     : Buffer.from(Object.entries(process.env).map(([key, value]) => key + "=" + value).join("\\0"));
+  const authSecret = "parent-runtime-secret";
   const text = JSON.stringify({
     credentialsReceived: brokerCredentials.host === "127.0.0.1" && brokerCredentials.port === 31337,
-    initialEnvironmentContainsToken: initialEnvironment.includes(Buffer.from(brokerCredentials.token)),
+    authReceived: latestAuthRequest.snapshot.providers[0].auth.apiKey === authSecret,
+    initialEnvironmentContainsBrokerToken: initialEnvironment.includes(Buffer.from(brokerCredentials.token)),
+    initialEnvironmentContainsAuth: initialEnvironment.includes(Buffer.from(authSecret)),
+    argvContainsAuth: process.argv.includes(authSecret),
+    preludeContainsAuth: JSON.stringify(authPrelude).includes(authSecret),
     descriptorMarker: process.env.PI_SUBAGENT_BROKER_FD,
   });
   event(message(text));
   event({ type: "agent_settled" });
 }
 `);
-	const result = await runChild(childRequest());
+	const result = await runChild(
+		childRequest({
+			auth: {
+				version: CHILD_AUTH_PROTOCOL,
+				providers: [{ provider: "test-provider", auth: { apiKey: authSecret } }],
+			},
+		}),
+	);
 	assert.equal(result.state, "completed");
 	assert.deepEqual(JSON.parse(result.result ?? "{}"), {
 		credentialsReceived: true,
-		initialEnvironmentContainsToken: false,
+		authReceived: true,
+		initialEnvironmentContainsBrokerToken: false,
+		initialEnvironmentContainsAuth: false,
+		argvContainsAuth: false,
+		preludeContainsAuth: false,
 		descriptorMarker: "3",
 	});
 });
@@ -427,6 +457,7 @@ function childRequest(overrides: Partial<ChildRequest> = {}): ChildRequest {
 		task: "task",
 		tools: ["read", "grep", "find", "ls"],
 		model: "test-provider/test-model",
+		auth: emptyAuth(),
 		thinkingLevel: "medium",
 		cwd: directory,
 		projectTrusted: false,
@@ -440,6 +471,10 @@ function childRequest(overrides: Partial<ChildRequest> = {}): ChildRequest {
 	};
 }
 
+function emptyAuth(): ChildAuthSnapshot {
+	return { version: CHILD_AUTH_PROTOCOL, providers: [] };
+}
+
 function installFakePi(source: string): void {
 	const packageDirectory = path.join(directory, "pi-core");
 	mkdirSync(packageDirectory, { recursive: true });
@@ -447,6 +482,27 @@ function installFakePi(source: string): void {
 		path.join(packageDirectory, "fake-pi.mjs"),
 		`import fs from "node:fs";
 const brokerCredentials = JSON.parse(fs.readFileSync(3, "utf8"));
+const authPrelude = JSON.parse(fs.readFileSync(6, "utf8"));
+const authInput = fs.createReadStream("", { fd: 4, autoClose: false, encoding: "utf8" });
+const authOutput = fs.createWriteStream("", { fd: 5, autoClose: false });
+let authBuffer = "";
+let latestAuthRequest;
+authInput.on("data", (chunk) => {
+  authBuffer += chunk;
+  while (true) {
+    const newline = authBuffer.indexOf("\\n");
+    if (newline < 0) break;
+    const line = authBuffer.slice(0, newline);
+    authBuffer = authBuffer.slice(newline + 1);
+    if (!line.trim()) continue;
+    latestAuthRequest = JSON.parse(line);
+    authOutput.write(JSON.stringify({
+      version: "pi-subagents:child-auth:v1",
+      id: latestAuthRequest.id,
+      ok: true,
+    }) + "\\n");
+  }
+});
 const event = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const respond = (command, success = true, error) => event({
   id: command.id,

@@ -9,7 +9,7 @@ Pi Subagents runs Pi jobs in separate child processes and supports authenticated
 - Runs each job in an isolated Pi child process and returns its job ID immediately.
 - Uses the task to define the child's specialization and the tool list to limit its capabilities.
 - Defaults work tools to `read`, `grep`, `find`, and `ls`.
-- Inherits the main agent's effective model and uses its thinking level by default.
+- Inherits the main agent's effective model, runtime authentication, and thinking level by default.
 - Gives the main agent and every child a context-specific `subagent_send` contract for bidirectional requests and responses.
 - Gives every child `subagent_wait` for an answer to a child-originated request.
 - Lets the main agent question a queued or running job through Pi RPC steering without retaining the child after completion.
@@ -161,11 +161,13 @@ Omitting `thinkingLevel` captures the main agent's effective level when `subagen
 
 The child inherits the main agent's effective provider and model when `subagent_spawn` executes.
 
-Spawn rejects providers registered by a parent extension because child processes disable unrelated extensions.
+Stored and environment credentials remain child-resolved.
 
-Spawn also rejects process-local runtime API keys, including a parent-only `--api-key` value.
+When the selected provider uses parent runtime authentication, the parent sends that provider's resolved request authentication and serializable provider overlay through private inherited pipes.
 
-Use stored or environment credentials that child processes can read.
+This supports session-local `pi-accounts` selections without loading parent extensions in the child.
+
+A parent-registered provider with executable configuration is rejected because functions cannot cross the process boundary safely.
 
 The extension does not expose a per-job model override.
 
@@ -175,11 +177,15 @@ The session starts one TCP broker on `127.0.0.1` with an operating-system-assign
 
 Each job receives one cryptographically random token bound to its job identity and session generation.
 
-The parent passes the broker credentials once through a private inherited pipe instead of placing them in the child's initial environment or command line.
+The parent passes broker credentials and runtime authentication through separate private inherited pipes instead of placing them in the child's initial environment or command line.
 
-The child bridge reads and closes that descriptor before model tool execution.
+An internal bootstrap extension applies and acknowledges inherited authentication before the initial task reaches the child model.
+
+The child bridge reads and closes the broker descriptor before model tool execution.
 
 Each child runs in Pi RPC mode so the parent can inject a main-originated request through `steer` after the initial prompt is accepted.
+
+Before each main-originated request, the parent refreshes the child authentication snapshot so account changes reach the retained RPC process without losing its conversation.
 
 Each child broker call uses one request-scoped connection, while a response wait uses an abortable long poll.
 
@@ -246,9 +252,11 @@ Selecting `bash`, `powershell`, `edit`, or `write` permits workspace mutation wi
 
 Every child disables session persistence, unrelated extensions, skills, and prompt templates.
 
-Provider selection therefore supports Pi's child-visible built-in and configured providers, not providers registered only by a parent extension.
+Provider selection supports Pi's child-visible built-in and configured providers plus parent runtime overlays that contain only serializable data.
 
-Credentials must be available independently to the child through Pi's stored credentials or its inherited environment.
+Stored and environment credentials remain independent child inputs.
+
+Parent runtime credentials, endpoints, headers, and model overlays are bounded, transferred only through inherited pipes, and never included in task text, results, logs, command arguments, or the initial environment.
 
 The broker accepts only loopback TCP connections with an active per-job token.
 
@@ -268,9 +276,9 @@ Parallel writers require disjoint ownership or workspace isolation outside this 
 
 ## 🚧 Limitations
 
-The extension does not load arbitrary extension tools or parent-registered model providers in child processes.
+The extension does not load arbitrary extension tools in child processes.
 
-Process-local runtime API keys are not forwarded to children.
+Parent providers that require executable configuration cannot be transferred and fail before child launch.
 
 The extension does not provide custom agents, per-job models, custom system prompts, peer-to-peer child messaging, retained conversations, user-directed follow-up work, mailboxes, Agent Teams, chains, fan-in aggregators, panels, workflow DAGs, dynamic scheduling, verification orchestration, nested subagents, or extension-owned semantic memory.
 
@@ -286,7 +294,7 @@ Jobs, broker requests, and retained results do not survive extension reload, ses
 
 ```text
 packages/pi-subagents/
-├── dist/                        # Generated Jiti runtime and child bridge
+├── dist/                        # Generated Jiti runtime, auth bootstrap, and child bridge
 ├── docs/                        # Concise tools and design references
 ├── scripts/                     # Deterministic runtime builder
 ├── skills/using-pi-subagents/  # Repository-only example delegation skill
